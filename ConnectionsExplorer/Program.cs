@@ -6,7 +6,9 @@ using Spectre.Console;
 using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json.Nodes;
+using GitHub.Copilot.SDK;
 
 var subscriptionArg = args.Length > 0 ? args[0] : null;
 var devOpsOrgArg = args.Length > 1 ? args[1] : null;
@@ -177,10 +179,14 @@ if (vaults.Count == 0 && !searchDevOps)
 // Pre-create SecretClients and cache secret names per vault (reused across searches)
 var secretClients = new Dictionary<string, SecretClient>();
 var cachedSecretNames = new Dictionary<string, List<string>>();
+var secretClientOptions = new SecretClientOptions
+{
+    Retry = { MaxRetries = 0 }
+};
 
 foreach (var vault in vaults)
 {
-    secretClients[vault.Name] = new SecretClient(vault.VaultUri, credential);
+    secretClients[vault.Name] = new SecretClient(vault.VaultUri, credential, secretClientOptions);
 }
 
 await AnsiConsole.Status()
@@ -217,27 +223,30 @@ await AnsiConsole.Status()
     });
 
 // Search loop — reuses cached clients and secret names
+var allSearchSummaries = new List<string>();
 var firstRun = true;
 while (true)
 {
     AnsiConsole.WriteLine();
-    string searchTerm;
+    List<string> searchTerms;
     if (firstRun && searchArg is not null)
     {
-        searchTerm = searchArg;
-        AnsiConsole.MarkupLine($"Searching for: [green]{Markup.Escape(searchTerm)}[/]");
+        searchTerms = searchArg.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        AnsiConsole.MarkupLine($"Searching for: [green]{Markup.Escape(string.Join(", ", searchTerms))}[/]");
     }
     else
     {
-        searchTerm = AnsiConsole.Ask<string>("Enter the [green]partial string[/] to search for (or [grey]\"quit\"[/] to exit):");
-        if (searchTerm.Equals("quit", StringComparison.OrdinalIgnoreCase) ||
-            searchTerm.Equals("exit", StringComparison.OrdinalIgnoreCase))
+        var input = AnsiConsole.Ask<string>("Enter the [green]partial string[/] to search for (comma-separated for multiple, or [grey]\"quit\"[/] to exit):");
+        if (input.Equals("quit", StringComparison.OrdinalIgnoreCase) ||
+            input.Equals("exit", StringComparison.OrdinalIgnoreCase))
         {
             AnsiConsole.MarkupLine("[grey]Goodbye![/]");
             break;
         }
+        searchTerms = input.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
     }
     firstRun = false;
+    var searchDisplay = string.Join(", ", searchTerms);
 
     var results = new ConcurrentBag<(string VaultName, string SecretName, string MatchedOn)>();
     var errors = new ConcurrentBag<(string VaultName, string SecretName, string Message)>();
@@ -256,7 +265,7 @@ while (true)
             {
                 var secrets = cachedSecretNames[vault.Name];
                 var progressTask = ctx.AddTask($"[cyan]{Markup.Escape(vault.Name)}[/]", maxValue: Math.Max(secrets.Count, 1));
-                await ScanVaultAsync(vault, secrets, searchTerm, progressTask, results, errors);
+                await ScanVaultAsync(vault, secrets, searchTerms, progressTask, results, errors);
             }
         });
 
@@ -265,13 +274,13 @@ while (true)
 
     if (results.IsEmpty)
     {
-        AnsiConsole.MarkupLine($"[yellow]No secrets matched the search term[/] [red]{Markup.Escape(searchTerm)}[/].");
+        AnsiConsole.MarkupLine($"[yellow]No secrets matched the search term(s)[/] [red]{Markup.Escape(searchDisplay)}[/].");
     }
     else
     {
         var table = new Table()
             .Border(TableBorder.Rounded)
-            .Title($"[bold green]Search Results for \"{Markup.Escape(searchTerm)}\"[/]")
+            .Title($"[bold green]Search Results for \"{Markup.Escape(searchDisplay)}\"[/]")
             .AddColumn(new TableColumn("[bold]Key Vault[/]").Centered())
             .AddColumn(new TableColumn("[bold]Secret Name[/]").Centered())
             .AddColumn(new TableColumn("[bold]Matched On[/]").Centered());
@@ -312,9 +321,9 @@ while (true)
     }
 
     // Azure DevOps code search
+    var devOpsResults = new List<(string Project, string Repo, string FilePath, string Branch)>();
     if (searchDevOps)
     {
-        var devOpsResults = new List<(string Project, string Repo, string FilePath, string Branch)>();
 
         await AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
@@ -327,9 +336,13 @@ while (true)
                     httpClient.DefaultRequestHeaders.Authorization =
                         new AuthenticationHeaderValue("Bearer", token.Token);
 
+                    var searchText = searchTerms.Count == 1
+                        ? $"{searchTerms[0]} ext:json"
+                        : $"({string.Join(" OR ", searchTerms)}) ext:json";
+
                     var searchRequest = new JsonObject
                     {
-                        ["searchText"] = $"{searchTerm} ext:json",
+                        ["searchText"] = searchText,
                         ["$skip"] = 0,
                         ["$top"] = 1000,
                         ["filters"] = new JsonObject(),
@@ -375,7 +388,7 @@ while (true)
         {
             var devOpsTable = new Table()
                 .Border(TableBorder.Rounded)
-                .Title($"[bold blue]Azure DevOps Results for \"{Markup.Escape(searchTerm)}\" (*.json files)[/]")
+                .Title($"[bold blue]Azure DevOps Results for \"{Markup.Escape(searchDisplay)}\" (*.json files)[/]")
                 .AddColumn(new TableColumn("[bold]Project[/]").Centered())
                 .AddColumn(new TableColumn("[bold]Repository[/]").Centered())
                 .AddColumn(new TableColumn("[bold]File Path[/]").Centered())
@@ -395,15 +408,115 @@ while (true)
         }
         else
         {
-            AnsiConsole.MarkupLine($"[yellow]No Azure DevOps matches found for[/] [red]{Markup.Escape(searchTerm)}[/] [yellow]in *.json files.[/]");
+            AnsiConsole.MarkupLine($"[yellow]No Azure DevOps matches found for[/] [red]{Markup.Escape(searchDisplay)}[/] [yellow]in *.json files.[/]");
         }
+    }
+
+    // Build search summary for Copilot report
+    var iterationSummary = new StringBuilder();
+    iterationSummary.AppendLine($"Search Terms: \"{searchDisplay}\"");
+    iterationSummary.AppendLine();
+    if (!results.IsEmpty)
+    {
+        iterationSummary.AppendLine("Key Vault Matches:");
+        foreach (var r in results.OrderBy(r => r.VaultName).ThenBy(r => r.SecretName))
+            iterationSummary.AppendLine($"  Vault: {r.VaultName}, Secret: {r.SecretName}, Matched On: {r.MatchedOn}");
+        iterationSummary.AppendLine($"Total Key Vault matches: {results.Count}");
+    }
+    else
+    {
+        iterationSummary.AppendLine("No Key Vault secrets matched.");
+    }
+    if (!errors.IsEmpty)
+    {
+        iterationSummary.AppendLine("Errors:");
+        foreach (var e in errors.OrderBy(e => e.VaultName).ThenBy(e => e.SecretName))
+            iterationSummary.AppendLine($"  Vault: {e.VaultName}, Secret: {(string.IsNullOrEmpty(e.SecretName) ? "-" : e.SecretName)}, Error: {e.Message}");
+    }
+    if (devOpsResults.Count > 0)
+    {
+        iterationSummary.AppendLine("Azure DevOps Matches:");
+        foreach (var r in devOpsResults.OrderBy(r => r.Project).ThenBy(r => r.Repo).ThenBy(r => r.FilePath))
+            iterationSummary.AppendLine($"  Project: {r.Project}, Repo: {r.Repo}, File: {r.FilePath}, Branch: {r.Branch}");
+        iterationSummary.AppendLine($"Total DevOps matches: {devOpsResults.Count}");
+    }
+    allSearchSummaries.Add(iterationSummary.ToString());
+}
+
+// Generate Copilot markdown report
+if (allSearchSummaries.Count > 0)
+{
+    AnsiConsole.WriteLine();
+    AnsiConsole.MarkupLine("[bold blue]Generating Markdown report with Copilot...[/]");
+
+    try
+    {
+        await using var copilotClient = new CopilotClient();
+        await copilotClient.StartAsync();
+
+        await using var session = await copilotClient.CreateSessionAsync(new SessionConfig
+        {
+            Streaming = true,
+            OnPermissionRequest = PermissionHandler.ApproveAll,
+            SystemMessage = new SystemMessageConfig
+            {
+                Mode = SystemMessageMode.Append,
+                Content = "You are a report generator. Given raw search results data, produce a clean, well-structured Markdown document with a title, summary, and tables. Output only the raw markdown content with no wrapping code fences."
+            }
+        });
+
+        var markdownContent = string.Empty;
+        var done = new TaskCompletionSource();
+
+        session.On(evt =>
+        {
+            switch (evt)
+            {
+                case AssistantMessageDeltaEvent delta:
+                    AnsiConsole.Write(delta.Data.DeltaContent);
+                    break;
+                case AssistantMessageEvent msg:
+                    markdownContent = msg.Data.Content;
+                    break;
+                case SessionErrorEvent error:
+                    AnsiConsole.MarkupLine($"\n[red]Copilot error: {Markup.Escape(error.Data.Message)}[/]");
+                    done.TrySetResult();
+                    break;
+                case SessionIdleEvent:
+                    done.TrySetResult();
+                    break;
+            }
+        });
+
+        var prompt = $"""
+            Attached are the search results across Azure DevOps, search the secrets of any accessible Azure KeyVault Secrets as well as any results in Azure DevOps repo code searches. This will be used to help track down any incoming connections to specified services. Create a well-formatted Markdown report for the following search results.
+            Include a title, summary section, and use tables where appropriate.
+            Output only the raw markdown content.
+
+            {string.Join("\n---\n", allSearchSummaries)}
+            """;
+
+        await session.SendAsync(new MessageOptions { Prompt = prompt });
+        await done.Task;
+
+        if (!string.IsNullOrWhiteSpace(markdownContent))
+        {
+            var outputPath = Path.Combine(Environment.CurrentDirectory, $"{searchArg}-{DateTime.Now:yyyyMMdd-HHmmss}.md");
+            await File.WriteAllTextAsync(outputPath, markdownContent);
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine($"[green]Markdown report saved to:[/] {Markup.Escape(outputPath)}");
+        }
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[yellow]Could not generate Copilot report:[/] {Markup.Escape(ex.Message)}");
     }
 }
 
 async Task ScanVaultAsync(
     (string Name, Uri VaultUri) vault,
     List<string> secrets,
-    string searchTerm,
+    List<string> searchTerms,
     ProgressTask progressTask,
     ConcurrentBag<(string VaultName, string SecretName, string MatchedOn)> results,
     ConcurrentBag<(string VaultName, string SecretName, string Message)> errors)
@@ -417,14 +530,14 @@ async Task ScanVaultAsync(
         {
             try
             {
-                if (secretName.Contains(searchTerm, StringComparison.OrdinalIgnoreCase))
+                if (searchTerms.Any(t => secretName.Contains(t, StringComparison.OrdinalIgnoreCase)))
                 {
                     results.Add((vault.Name, secretName, "Name"));
                 }
 
                 var secret = await client.GetSecretAsync(secretName, cancellationToken: cts.Token);
                 if (secret.Value.Value is not null &&
-                    secret.Value.Value.Contains(searchTerm, StringComparison.OrdinalIgnoreCase))
+                    searchTerms.Any(t => secret.Value.Value.Contains(t, StringComparison.OrdinalIgnoreCase)))
                 {
                     results.Add((vault.Name, secretName, "Value"));
                 }
