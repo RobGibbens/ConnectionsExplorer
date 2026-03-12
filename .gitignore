@@ -45,5 +45,5 @@ Thumbs.db
 
 .nx/cache
 .nx/workspace-data
-/ConnectionsExplorer/bin/Debug/net10.0
+/ConnectionsExplorer/bin
 /ConnectionsExplorer/obj

@@ -8,6 +8,10 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json.Nodes;
 
+var subscriptionArg = args.Length > 0 ? args[0] : null;
+var devOpsOrgArg = args.Length > 1 ? args[1] : null;
+var searchArg = args.Length > 2 ? args[2] : null;
+
 var credential = new AzureCliCredential();
 var armClient = new ArmClient(credential);
 using var httpClient = new HttpClient();
@@ -30,12 +34,32 @@ if (subscriptions.Count == 0)
     return;
 }
 
-var selectedSubscription = AnsiConsole.Prompt(
-    new SelectionPrompt<Azure.ResourceManager.Resources.SubscriptionResource>()
-        .Title("Select a [green]subscription[/] to scan:")
-        .PageSize(15)
-        .UseConverter(s => $"{s.Data.DisplayName} ({s.Data.SubscriptionId})")
-        .AddChoices(subscriptions));
+Azure.ResourceManager.Resources.SubscriptionResource selectedSubscription;
+
+if (subscriptionArg is not null)
+{
+    var match = subscriptions.FirstOrDefault(s =>
+        s.Data.DisplayName.Contains(subscriptionArg, StringComparison.OrdinalIgnoreCase)
+        || s.Data.SubscriptionId.Equals(subscriptionArg, StringComparison.OrdinalIgnoreCase));
+
+    if (match is null)
+    {
+        AnsiConsole.MarkupLine($"[red]No subscription matching '{Markup.Escape(subscriptionArg)}' was found.[/]");
+        return;
+    }
+
+    selectedSubscription = match;
+    AnsiConsole.MarkupLine($"Using subscription: [green]{Markup.Escape(selectedSubscription.Data.DisplayName)}[/] ({selectedSubscription.Data.SubscriptionId})");
+}
+else
+{
+    selectedSubscription = AnsiConsole.Prompt(
+        new SelectionPrompt<Azure.ResourceManager.Resources.SubscriptionResource>()
+            .Title("Select a [green]subscription[/] to scan:")
+            .PageSize(15)
+            .UseConverter(s => $"{s.Data.DisplayName} ({s.Data.SubscriptionId})")
+            .AddChoices(subscriptions));
+}
 
 var vaults = new List<(string Name, Uri VaultUri)>();
 
@@ -77,7 +101,16 @@ AnsiConsole.MarkupLine($"Found [green]{vaults.Count}[/] Key Vault(s).");
 // A token is requested for the Azure DevOps resource ID (499b84ac-1321-427f-aa17-267ca6975798).
 // Ensure your Azure AD / Entra ID account has access to the Azure DevOps organization.
 AnsiConsole.WriteLine();
-var devOpsOrg = AnsiConsole.Ask<string>("Enter your Azure DevOps [green]organization name[/] (or [grey]\"skip\"[/] to skip DevOps search):");
+string devOpsOrg;
+if (devOpsOrgArg is not null)
+{
+    devOpsOrg = devOpsOrgArg;
+    AnsiConsole.MarkupLine($"Using Azure DevOps organization: [green]{Markup.Escape(devOpsOrg)}[/]");
+}
+else
+{
+    devOpsOrg = AnsiConsole.Ask<string>("Enter your Azure DevOps [green]organization name[/] (or [grey]\"skip\"[/] to skip DevOps search):");
+}
 var searchDevOps = !devOpsOrg.Equals("skip", StringComparison.OrdinalIgnoreCase);
 var devOpsRepos = new List<(string Project, string Repo, string DefaultBranch)>();
 
@@ -184,16 +217,27 @@ await AnsiConsole.Status()
     });
 
 // Search loop — reuses cached clients and secret names
+var firstRun = true;
 while (true)
 {
     AnsiConsole.WriteLine();
-    var searchTerm = AnsiConsole.Ask<string>("Enter the [green]partial string[/] to search for (or [grey]\"quit\"[/] to exit):");
-    if (searchTerm.Equals("quit", StringComparison.OrdinalIgnoreCase) ||
-        searchTerm.Equals("exit", StringComparison.OrdinalIgnoreCase))
+    string searchTerm;
+    if (firstRun && searchArg is not null)
     {
-        AnsiConsole.MarkupLine("[grey]Goodbye![/]");
-        break;
+        searchTerm = searchArg;
+        AnsiConsole.MarkupLine($"Searching for: [green]{Markup.Escape(searchTerm)}[/]");
     }
+    else
+    {
+        searchTerm = AnsiConsole.Ask<string>("Enter the [green]partial string[/] to search for (or [grey]\"quit\"[/] to exit):");
+        if (searchTerm.Equals("quit", StringComparison.OrdinalIgnoreCase) ||
+            searchTerm.Equals("exit", StringComparison.OrdinalIgnoreCase))
+        {
+            AnsiConsole.MarkupLine("[grey]Goodbye![/]");
+            break;
+        }
+    }
+    firstRun = false;
 
     var results = new ConcurrentBag<(string VaultName, string SecretName, string MatchedOn)>();
     var errors = new ConcurrentBag<(string VaultName, string SecretName, string Message)>();
