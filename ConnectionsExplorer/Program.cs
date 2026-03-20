@@ -402,9 +402,11 @@ async Task<List<(string Project, string Repo, string FilePath, string Branch)>> 
 {
     var devOpsResults = new List<(string Project, string Repo, string FilePath, string Branch)>();
 
+    var extensions = new[] { "json", "ts", "config", "cs", "js" };
+
     await AnsiConsole.Status()
         .Spinner(Spinner.Known.Dots)
-        .StartAsync("Searching Azure DevOps repos for *.json files...", async ctx =>
+        .StartAsync("Searching Azure DevOps repos for *.json, *.ts, *.config, *.cs files...", async ctx =>
         {
             try
             {
@@ -413,45 +415,50 @@ async Task<List<(string Project, string Repo, string FilePath, string Branch)>> 
                 httpClient.DefaultRequestHeaders.Authorization =
                     new AuthenticationHeaderValue("Bearer", token.Token);
 
-                var searchText = searchTerms.Count == 1
-                    ? $"{searchTerms[0]} ext:json"
-                    : $"({string.Join(" OR ", searchTerms)}) ext:json";
-
-                var searchRequest = new JsonObject
+                foreach (var ext in extensions)
                 {
-                    ["searchText"] = searchText,
-                    ["$skip"] = 0,
-                    ["$top"] = 1000,
-                    ["filters"] = new JsonObject(),
-                    ["includeFacets"] = false
-                };
+                    ctx.Status($"Searching Azure DevOps repos for [cyan]*.{ext}[/] files...");
 
-                var response = await httpClient.PostAsJsonAsync(
-                    $"https://almsearch.dev.azure.com/{Uri.EscapeDataString(org)}/_apis/search/codesearchresults?api-version=7.1-preview.1",
-                    searchRequest);
+                    var searchText = searchTerms.Count == 1
+                        ? $"{searchTerms[0]} ext:{ext}"
+                        : $"({string.Join(" OR ", searchTerms)}) ext:{ext}";
 
-                if (response.IsSuccessStatusCode)
-                {
-                    var result = await response.Content.ReadFromJsonAsync<JsonObject>();
-                    if (result?["results"] is JsonArray hits)
+                    var searchRequest = new JsonObject
                     {
-                        foreach (var hit in hits)
+                        ["searchText"] = searchText,
+                        ["$skip"] = 0,
+                        ["$top"] = 1000,
+                        ["filters"] = new JsonObject(),
+                        ["includeFacets"] = false
+                    };
+
+                    var response = await httpClient.PostAsJsonAsync(
+                        $"https://almsearch.dev.azure.com/{Uri.EscapeDataString(org)}/_apis/search/codesearchresults?api-version=7.1-preview.1",
+                        searchRequest);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var result = await response.Content.ReadFromJsonAsync<JsonObject>();
+                        if (result?["results"] is JsonArray hits)
                         {
-                            var filePath = hit?["path"]?.GetValue<string>() ?? "";
-                            var project = hit?["project"]?["name"]?.GetValue<string>() ?? "";
-                            var repo = hit?["repository"]?["name"]?.GetValue<string>() ?? "";
-                            var branch = hit?["versions"] is JsonArray versions && versions.Count > 0
-                                ? versions[0]?["branchName"]?.GetValue<string>() ?? ""
-                                : "";
-                            devOpsResults.Add((project, repo, filePath, branch));
+                            foreach (var hit in hits)
+                            {
+                                var filePath = hit?["path"]?.GetValue<string>() ?? "";
+                                var project = hit?["project"]?["name"]?.GetValue<string>() ?? "";
+                                var repo = hit?["repository"]?["name"]?.GetValue<string>() ?? "";
+                                var branch = hit?["versions"] is JsonArray versions && versions.Count > 0
+                                    ? versions[0]?["branchName"]?.GetValue<string>() ?? ""
+                                    : "";
+                                devOpsResults.Add((project, repo, filePath, branch));
+                            }
                         }
                     }
-                }
-                else
-                {
-                    var errorBody = await response.Content.ReadAsStringAsync();
-                    AnsiConsole.MarkupLine($"[yellow]Azure DevOps search failed:[/] {Markup.Escape(response.StatusCode.ToString())}");
-                    AnsiConsole.MarkupLine($"[grey]{Markup.Escape(errorBody)}[/]");
+                    else
+                    {
+                        var errorBody = await response.Content.ReadAsStringAsync();
+                        AnsiConsole.MarkupLine($"[yellow]Azure DevOps search failed for *.{ext}:[/] {Markup.Escape(response.StatusCode.ToString())}");
+                        AnsiConsole.MarkupLine($"[grey]{Markup.Escape(errorBody)}[/]");
+                    }
                 }
             }
             catch (Exception ex)
@@ -648,7 +655,7 @@ void DisplayDevOpsResults(
     {
         var devOpsTable = new Table()
             .Border(TableBorder.Rounded)
-            .Title($"[bold blue]Azure DevOps Results for \"{Markup.Escape(searchDisplay)}\" (*.json files)[/]")
+            .Title($"[bold blue]Azure DevOps Results for \"{Markup.Escape(searchDisplay)}\" (*.json, *.ts, *.config, *.cs files)[/]")
             .AddColumn(new TableColumn("[bold]Project[/]").Centered())
             .AddColumn(new TableColumn("[bold]Repository[/]").Centered())
             .AddColumn(new TableColumn("[bold]File Path[/]").Centered())
@@ -668,7 +675,7 @@ void DisplayDevOpsResults(
     }
     else
     {
-        AnsiConsole.MarkupLine($"[yellow]No Azure DevOps matches found for[/] [red]{Markup.Escape(searchDisplay)}[/] [yellow]in *.json files.[/]");
+        AnsiConsole.MarkupLine($"[yellow]No Azure DevOps matches found for[/] [red]{Markup.Escape(searchDisplay)}[/] [yellow]in *.json, *.ts, *.config, *.cs files.[/]");
     }
 }
 
@@ -756,9 +763,13 @@ async Task GenerateCopilotReportAsync(List<string> summaries, string? searchArg)
         });
 
         var prompt = $"""
-            Attached are the search results across Azure DevOps, search the secrets of any accessible Azure KeyVault Secrets as well as any results in Azure DevOps repo code searches. This will be used to help track down any incoming connections to specified services. Create a well-formatted Markdown report for the following search results.
+            Attached are the search results across Azure DevOps, \
+            search the secrets of any accessible Azure KeyVault Secrets as well as any results in Azure DevOps repo code searches. \
+            This will be used to help track down any incoming connections to specified services. \
+            Create a well-formatted Markdown report for the following search results.
             Include a title, summary section, and use tables where appropriate.
-            Output only the raw markdown content.
+            Output only the raw markdown content. Be sure to include all relevant information from the search results in the report. \
+            The name of the report file should be "Inbound-Direct-Connections-{searchArg}-{DateTime.Now:yyyyMMdd-HHmmss}.md". \
 
             {string.Join("\n---\n", summaries)}
             """;
