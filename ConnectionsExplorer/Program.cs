@@ -402,11 +402,11 @@ async Task<List<(string Project, string Repo, string FilePath, string Branch)>> 
 {
     var devOpsResults = new List<(string Project, string Repo, string FilePath, string Branch)>();
 
-    var extensions = new[] { "json", "ts", "config", "cs", "js" };
+    var extensions = new[] { "json", "ts", "config", "cs", "js", "qa" };
 
     await AnsiConsole.Status()
         .Spinner(Spinner.Known.Dots)
-        .StartAsync("Searching Azure DevOps repos for *.json, *.ts, *.config, *.cs files...", async ctx =>
+        .StartAsync("Searching Azure DevOps repos for *.json, *.ts, *.config, *.js, *.qa, *.cs files...", async ctx =>
         {
             try
             {
