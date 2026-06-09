@@ -1,5 +1,7 @@
 using Azure.Identity;
 using Azure.ResourceManager;
+using Azure.ResourceManager.AppService;
+using Azure.ResourceManager.AppService.Models;
 using Azure.ResourceManager.KeyVault;
 using Azure.Security.KeyVault.Secrets;
 using Spectre.Console;
@@ -41,7 +43,7 @@ if (searchArg is null)
     }
 }
 
-var credential = new AzureCliCredential();
+var credential = new Azure.Identity.AzureCliCredential();
 var armClient = new ArmClient(credential);
 using var httpClient = new HttpClient();
 var vaultCacheDir = Path.Combine(
@@ -60,18 +62,41 @@ var selectedSubscription = SelectSubscription(subscriptions, subscriptionArg);
 if (selectedSubscription is null)
     return;
 
-// Discover Key Vaults in the selected subscription (with local cache)
-var vaults = await LoadCachedVaultsAsync(selectedSubscription.Data.SubscriptionId);
-if (vaults is null)
+var selectableResourceGroups = await LoadSelectableResourceGroupsAsync(selectedSubscription);
+var selectedResourceGroups = SelectResourceGroups(selectableResourceGroups);
+var selectedResourceGroupSet = selectedResourceGroups
+    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+if (selectedResourceGroups.Count == 0)
 {
-    vaults = await DiscoverKeyVaultsAsync(selectedSubscription);
-    await SaveVaultsCacheAsync(selectedSubscription.Data.SubscriptionId, vaults);
+    AnsiConsole.MarkupLine("[yellow]No resource groups selected. Azure resource searches will be skipped.[/]");
 }
 else
 {
-    AnsiConsole.MarkupLine("[grey]Using cached Key Vault list (less than 1 hour old).[/]");
+    AnsiConsole.MarkupLine($"Selected [green]{selectedResourceGroups.Count}[/] resource group(s) for Azure resource searches.");
+}
+
+// Discover Key Vaults in the selected subscription (with local cache)
+List<(string Name, Uri VaultUri)> vaults;
+if (selectedResourceGroupSet.Count == 0)
+{
+    vaults = [];
+}
+else
+{
+    vaults = await DiscoverKeyVaultsAsync(selectedSubscription, selectedResourceGroupSet);
+    await SaveVaultsCacheAsync(selectedSubscription.Data.SubscriptionId, vaults);
 }
 AnsiConsole.MarkupLine($"Found [green]{vaults.Count}[/] Key Vault(s).");
+
+var appDiscovery = selectedResourceGroupSet.Count == 0
+    ? new AppServiceDiscoveryResult([], [])
+    : await DiscoverAppServiceAppsAsync(selectedSubscription, selectedResourceGroups);
+
+var webAppConfigurations = await LoadAppServiceConfigurationsAsync(appDiscovery.WebApps, AppServiceResourceType.WebApp);
+var functionAppConfigurations = await LoadAppServiceConfigurationsAsync(appDiscovery.FunctionApps, AppServiceResourceType.FunctionApp);
+
+AnsiConsole.MarkupLine($"Found [green]{appDiscovery.WebApps.Count}[/] Web App(s) and [green]{appDiscovery.FunctionApps.Count}[/] Function App(s).");
 
 // Set up Azure DevOps
 AnsiConsole.WriteLine();
@@ -84,9 +109,12 @@ if (searchDevOps)
         AnsiConsole.MarkupLine($"Found [green]{devOpsRepos.Count}[/] Azure DevOps repo(s) in organization [blue]{Markup.Escape(devOpsOrg)}[/].");
 }
 
-if (vaults.Count == 0 && !searchDevOps)
+if (vaults.Count == 0
+    && webAppConfigurations.Count == 0
+    && functionAppConfigurations.Count == 0
+    && !searchDevOps)
 {
-    AnsiConsole.MarkupLine("[yellow]No Key Vaults or DevOps repos available. Ensure you have access and are logged in via 'az login'.[/]");
+    AnsiConsole.MarkupLine("[yellow]No Key Vaults, Web Apps, Function Apps, or DevOps repos are available. Ensure you have access and are logged in via 'az login'.[/]");
     return;
 }
 
@@ -124,6 +152,14 @@ while (true)
     DisplayVaultResults(results, searchDisplay);
     DisplayErrors(errors);
 
+    var (webAppResults, webAppErrors) = SearchAppServiceConfigurations(webAppConfigurations, searchTerms);
+    DisplayAppServiceResults(AppServiceResourceType.WebApp, webAppResults, searchDisplay);
+    DisplayAppServiceErrors(AppServiceResourceType.WebApp, webAppErrors);
+
+    var (functionAppResults, functionAppErrors) = SearchAppServiceConfigurations(functionAppConfigurations, searchTerms);
+    DisplayAppServiceResults(AppServiceResourceType.FunctionApp, functionAppResults, searchDisplay);
+    DisplayAppServiceErrors(AppServiceResourceType.FunctionApp, functionAppErrors);
+
     var devOpsResults = new List<(string Project, string Repo, string FilePath, string Branch)>();
     if (searchDevOps)
     {
@@ -131,7 +167,15 @@ while (true)
         DisplayDevOpsResults(devOpsResults, searchDisplay);
     }
 
-    allSearchSummaries.Add(BuildSearchSummary(searchDisplay, results, errors, devOpsResults));
+    allSearchSummaries.Add(BuildSearchSummary(
+        searchDisplay,
+        results,
+        errors,
+        webAppResults,
+        webAppErrors,
+        functionAppResults,
+        functionAppErrors,
+        devOpsResults));
 
     if (wasCliSearch)
         break;
@@ -188,6 +232,49 @@ Azure.ResourceManager.Resources.SubscriptionResource? SelectSubscription(
             .AddChoices(subscriptions));
 }
 
+async Task<List<string>> LoadSelectableResourceGroupsAsync(
+    Azure.ResourceManager.Resources.SubscriptionResource subscription)
+{
+    var resourceGroups = new List<string>();
+    await AnsiConsole.Status()
+        .Spinner(Spinner.Known.Dots)
+        .StartAsync($"Loading resource groups in subscription [blue]{Markup.Escape(subscription.Data.DisplayName)}[/]...", async ctx =>
+        {
+            await foreach (var resourceGroup in subscription.GetResourceGroups().GetAllAsync())
+            {
+                var resourceGroupName = resourceGroup.Data.Name;
+                if (resourceGroupName.Contains("QA", StringComparison.OrdinalIgnoreCase)
+                    || resourceGroupName.Contains("Staging", StringComparison.OrdinalIgnoreCase))
+                {
+                    resourceGroups.Add(resourceGroupName);
+                }
+            }
+        });
+
+    return resourceGroups
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+List<string> SelectResourceGroups(List<string> resourceGroups)
+{
+    if (resourceGroups.Count == 0)
+    {
+        AnsiConsole.MarkupLine("[yellow]No QA or Staging resource groups were found in the selected subscription.[/]");
+        return [];
+    }
+
+    return AnsiConsole.Prompt(
+        new MultiSelectionPrompt<string>()
+            .Title("Select [green]resource groups[/] to search for Key Vaults, Web Apps, and Functions:")
+            .InstructionsText(
+                "[grey](Press [blue]<space>[/] to toggle a resource group, [green]<enter>[/] to accept. Leave all unselected to search no Azure resources.)[/]")
+            .NotRequired()
+            .PageSize(15)
+            .AddChoices(resourceGroups));
+}
+
 // ─────────────────────────────── Key Vault Cache ───────────────────────────────
 
 async Task<List<(string Name, Uri VaultUri)>?> LoadCachedVaultsAsync(string subscriptionId)
@@ -236,7 +323,8 @@ async Task SaveVaultsCacheAsync(string subscriptionId, List<(string Name, Uri Va
 // ─────────────────────────────── Key Vault Discovery ───────────────────────────────
 
 async Task<List<(string Name, Uri VaultUri)>> DiscoverKeyVaultsAsync(
-    Azure.ResourceManager.Resources.SubscriptionResource subscription)
+    Azure.ResourceManager.Resources.SubscriptionResource subscription,
+    HashSet<string> selectedResourceGroups)
 {
     var found = new List<(string Name, Uri VaultUri)>();
     await AnsiConsole.Status()
@@ -248,9 +336,7 @@ async Task<List<(string Name, Uri VaultUri)>> DiscoverKeyVaultsAsync(
                 await foreach (var vault in subscription.GetKeyVaultsAsync())
                 {
                     var resourceGroupName = vault.Id.ResourceGroupName;
-                    if (resourceGroupName is null ||
-                        (!resourceGroupName.Contains("QA", StringComparison.OrdinalIgnoreCase) &&
-                         !resourceGroupName.Contains("Staging", StringComparison.OrdinalIgnoreCase)))
+                    if (resourceGroupName is null || !selectedResourceGroups.Contains(resourceGroupName))
                     {
                         AnsiConsole.MarkupLine($"  Skipping vault: [grey]{Markup.Escape(vault.Data.Name)}[/] (RG: {Markup.Escape(resourceGroupName ?? "unknown")})");
                         continue;
@@ -271,6 +357,226 @@ async Task<List<(string Name, Uri VaultUri)>> DiscoverKeyVaultsAsync(
         });
     return found;
 }
+
+async Task<AppServiceDiscoveryResult> DiscoverAppServiceAppsAsync(
+    Azure.ResourceManager.Resources.SubscriptionResource subscription,
+    List<string> selectedResourceGroups)
+{
+    var webApps = new List<AppServiceApp>();
+    var functionApps = new List<AppServiceApp>();
+
+    await AnsiConsole.Status()
+        .Spinner(Spinner.Known.Dots)
+        .StartAsync($"Discovering Web Apps and Function Apps in subscription [blue]{Markup.Escape(subscription.Data.DisplayName)}[/]...", async ctx =>
+        {
+            foreach (var resourceGroupName in selectedResourceGroups)
+            {
+                ctx.Status($"Discovering App Service resources in [cyan]{Markup.Escape(resourceGroupName)}[/]...");
+
+                try
+                {
+                    var resourceGroup = await subscription.GetResourceGroups().GetAsync(resourceGroupName);
+                    await foreach (var site in resourceGroup.Value.GetWebSites().GetAllAsync())
+                    {
+                        var kind = site.Data.Kind ?? string.Empty;
+                        var isFunctionApp = kind.Contains("functionapp", StringComparison.OrdinalIgnoreCase);
+                        var slotNames = new List<string>();
+
+                        try
+                        {
+                            await foreach (var slot in site.GetWebSiteSlots().GetAllAsync())
+                            {
+                                slotNames.Add(slot.Data.Name);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            AnsiConsole.MarkupLine($"  [yellow]Warning:[/] Could not enumerate slots for [cyan]{Markup.Escape(site.Data.Name)}[/]: {Markup.Escape(ex.Message)}");
+                        }
+
+                        var app = new AppServiceApp(
+                            subscription.Data.SubscriptionId,
+                            site.Data.Name,
+                            resourceGroupName,
+                            kind,
+                            slotNames.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList());
+
+                        if (isFunctionApp)
+                        {
+                            functionApps.Add(app);
+                            AnsiConsole.MarkupLine($"  Found Function App: [green]{Markup.Escape(site.Data.Name)}[/] (RG: {Markup.Escape(resourceGroupName)})");
+                        }
+                        else
+                        {
+                            webApps.Add(app);
+                            AnsiConsole.MarkupLine($"  Found Web App: [green]{Markup.Escape(site.Data.Name)}[/] (RG: {Markup.Escape(resourceGroupName)})");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine($"[yellow]Warning:[/] Could not enumerate App Service resources in resource group [blue]{Markup.Escape(resourceGroupName)}[/]: {Markup.Escape(ex.Message)}");
+                }
+            }
+        });
+
+    return new AppServiceDiscoveryResult(
+        webApps.OrderBy(app => app.ResourceGroupName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(app => app.AppName, StringComparer.OrdinalIgnoreCase)
+            .ToList(),
+        functionApps.OrderBy(app => app.ResourceGroupName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(app => app.AppName, StringComparer.OrdinalIgnoreCase)
+            .ToList());
+}
+
+async Task<List<AppServiceConfiguration>> LoadAppServiceConfigurationsAsync(
+    List<AppServiceApp> apps,
+    AppServiceResourceType resourceType)
+{
+    var configurations = new List<AppServiceConfiguration>();
+
+    await AnsiConsole.Status()
+        .Spinner(Spinner.Known.Dots)
+        .StartAsync($"Loading {GetAppServiceResourceTypeLabel(resourceType)} configuration...", async ctx =>
+        {
+            foreach (var app in apps)
+            {
+                ctx.Status($"Loading configuration for [cyan]{Markup.Escape(app.AppName)}[/]...");
+                var entries = new List<AppServiceConfigurationEntry>();
+                var errors = new List<string>();
+
+                try
+                {
+                    var siteResourceId = WebSiteResource.CreateResourceIdentifier(
+                        app.SubscriptionId,
+                        app.ResourceGroupName,
+                        app.AppName);
+                    var site = armClient.GetWebSiteResource(siteResourceId);
+
+                    await LoadRootAppServiceConfigurationAsync(site, entries, errors);
+
+                    foreach (var slotName in app.SlotNames)
+                    {
+                        await LoadSlotAppServiceConfigurationAsync(site, slotName, entries, errors);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(ex.Message);
+                }
+
+                configurations.Add(new AppServiceConfiguration(app, resourceType, entries, errors));
+            }
+        });
+
+    return configurations;
+}
+
+async Task LoadRootAppServiceConfigurationAsync(
+    WebSiteResource site,
+    List<AppServiceConfigurationEntry> entries,
+    List<string> errors)
+{
+    try
+    {
+        var appSettings = await site.GetApplicationSettingsAsync();
+        AddAppSettingEntries(entries, appSettings.Value.Properties, null);
+    }
+    catch (Exception ex)
+    {
+        errors.Add($"Root app settings: {ex.Message}");
+    }
+
+    try
+    {
+        var connectionStrings = await site.GetConnectionStringsAsync();
+        AddConnectionStringEntries(entries, connectionStrings.Value.Properties, null);
+    }
+    catch (Exception ex)
+    {
+        errors.Add($"Root connection strings: {ex.Message}");
+    }
+}
+
+async Task LoadSlotAppServiceConfigurationAsync(
+    WebSiteResource site,
+    string slotName,
+    List<AppServiceConfigurationEntry> entries,
+    List<string> errors)
+{
+    try
+    {
+        var slotResourceId = WebSiteSlotResource.CreateResourceIdentifier(
+            site.Id.SubscriptionId,
+            site.Id.ResourceGroupName!,
+            site.Data.Name,
+            slotName);
+        var slot = armClient.GetWebSiteSlotResource(slotResourceId);
+
+        try
+        {
+            var appSettings = await slot.GetApplicationSettingsSlotAsync();
+            AddAppSettingEntries(entries, appSettings.Value.Properties, slotName);
+        }
+        catch (Exception ex)
+        {
+            errors.Add($"Slot '{slotName}' app settings: {ex.Message}");
+        }
+
+        try
+        {
+            var connectionStrings = await slot.GetConnectionStringsSlotAsync();
+            AddConnectionStringEntries(entries, connectionStrings.Value.Properties, slotName);
+        }
+        catch (Exception ex)
+        {
+            errors.Add($"Slot '{slotName}' connection strings: {ex.Message}");
+        }
+    }
+    catch (Exception ex)
+    {
+        errors.Add($"Slot '{slotName}': {ex.Message}");
+    }
+}
+
+void AddAppSettingEntries(
+    List<AppServiceConfigurationEntry> entries,
+    IDictionary<string, string>? properties,
+    string? slotName)
+{
+    if (properties is null)
+        return;
+
+    foreach (var property in properties)
+    {
+        entries.Add(new AppServiceConfigurationEntry(
+            slotName,
+            AppServiceConfigurationEntryType.AppSetting,
+            property.Key,
+            property.Value));
+    }
+}
+
+void AddConnectionStringEntries(
+    List<AppServiceConfigurationEntry> entries,
+    IDictionary<string, ConnStringValueTypePair>? properties,
+    string? slotName)
+{
+    if (properties is null)
+        return;
+
+    foreach (var property in properties)
+    {
+        entries.Add(new AppServiceConfigurationEntry(
+            slotName,
+            AppServiceConfigurationEntryType.ConnectionString,
+            property.Key,
+            property.Value.Value));
+    }
+}
+
+string GetAppServiceResourceTypeLabel(AppServiceResourceType resourceType)
+    => resourceType == AppServiceResourceType.FunctionApp ? "Function App" : "Web App";
 
 Dictionary<string, SecretClient> CreateSecretClients(List<(string Name, Uri VaultUri)> vaults)
 {
@@ -586,6 +892,57 @@ async Task ScanSingleVaultAsync(
     }
 }
 
+(List<AppServiceSearchResult> Results, List<AppServiceSearchError> Errors) SearchAppServiceConfigurations(
+    List<AppServiceConfiguration> configurations,
+    List<string> searchTerms)
+{
+    var results = new List<AppServiceSearchResult>();
+    var errors = new List<AppServiceSearchError>();
+
+    foreach (var configuration in configurations)
+    {
+        foreach (var error in configuration.Errors)
+        {
+            errors.Add(new AppServiceSearchError(
+                configuration.ResourceType,
+                configuration.App.ResourceGroupName,
+                configuration.App.AppName,
+                null,
+                error));
+        }
+
+        foreach (var entry in configuration.Entries)
+        {
+            if (searchTerms.Any(t => entry.Key.Contains(t, StringComparison.OrdinalIgnoreCase)))
+            {
+                results.Add(new AppServiceSearchResult(
+                    configuration.ResourceType,
+                    configuration.App.ResourceGroupName,
+                    configuration.App.AppName,
+                    entry.SlotName,
+                    entry.EntryType,
+                    entry.Key,
+                    "Name"));
+            }
+
+            if (!string.IsNullOrEmpty(entry.Value)
+                && searchTerms.Any(t => entry.Value.Contains(t, StringComparison.OrdinalIgnoreCase)))
+            {
+                results.Add(new AppServiceSearchResult(
+                    configuration.ResourceType,
+                    configuration.App.ResourceGroupName,
+                    configuration.App.AppName,
+                    entry.SlotName,
+                    entry.EntryType,
+                    entry.Key,
+                    "Value"));
+            }
+        }
+    }
+
+    return (results, errors);
+}
+
 // ─────────────────────────────── Display Results ───────────────────────────────
 
 void DisplayVaultResults(
@@ -679,12 +1036,96 @@ void DisplayDevOpsResults(
     }
 }
 
+void DisplayAppServiceResults(
+    AppServiceResourceType resourceType,
+    List<AppServiceSearchResult> results,
+    string searchDisplay)
+{
+    AnsiConsole.WriteLine();
+
+    if (results.Count == 0)
+    {
+        AnsiConsole.MarkupLine($"[yellow]No {GetAppServiceResourceTypeLabel(resourceType)} matches found for[/] [red]{Markup.Escape(searchDisplay)}[/].[yellow][/]");
+        return;
+    }
+
+    var resourceLabel = GetAppServiceResourceTypeLabel(resourceType);
+    var accentColor = resourceType == AppServiceResourceType.FunctionApp ? "purple" : "aqua";
+    var table = new Table()
+        .Border(TableBorder.Rounded)
+        .Title($"[bold {accentColor}]{Markup.Escape(resourceLabel)} Results for \"{Markup.Escape(searchDisplay)}\"[/]")
+        .AddColumn(new TableColumn("[bold]Resource Group[/]").Centered())
+        .AddColumn(new TableColumn($"[bold]{Markup.Escape(resourceLabel)}[/]").Centered())
+        .AddColumn(new TableColumn("[bold]Slot[/]").Centered())
+        .AddColumn(new TableColumn("[bold]Entry Type[/]").Centered())
+        .AddColumn(new TableColumn("[bold]Key[/]").Centered())
+        .AddColumn(new TableColumn("[bold]Matched On[/]").Centered());
+
+    foreach (var result in results
+        .OrderBy(r => r.ResourceGroupName)
+        .ThenBy(r => r.AppName)
+        .ThenBy(r => r.SlotName)
+        .ThenBy(r => r.Key))
+    {
+        var matchColor = result.MatchedOn == "Value" ? "red" : "green";
+        table.AddRow(
+            Markup.Escape(result.ResourceGroupName),
+            Markup.Escape(result.AppName),
+            string.IsNullOrEmpty(result.SlotName) ? "-" : Markup.Escape(result.SlotName),
+            Markup.Escape(result.EntryType.ToString()),
+            Markup.Escape(result.Key),
+            $"[{matchColor}]{result.MatchedOn}[/]");
+    }
+
+    AnsiConsole.Write(table);
+    AnsiConsole.MarkupLine($"\n[bold]Total {Markup.Escape(resourceLabel)} matches:[/] [green]{results.Count}[/]");
+}
+
+void DisplayAppServiceErrors(
+    AppServiceResourceType resourceType,
+    List<AppServiceSearchError> errors)
+{
+    if (errors.Count == 0)
+        return;
+
+    AnsiConsole.WriteLine();
+
+    var resourceLabel = GetAppServiceResourceTypeLabel(resourceType);
+    var table = new Table()
+        .Border(TableBorder.Rounded)
+        .Title($"[bold yellow]{Markup.Escape(resourceLabel)} Errors & Warnings[/]")
+        .AddColumn(new TableColumn("[bold]Resource Group[/]").Centered())
+        .AddColumn(new TableColumn($"[bold]{Markup.Escape(resourceLabel)}[/]").Centered())
+        .AddColumn(new TableColumn("[bold]Slot[/]").Centered())
+        .AddColumn(new TableColumn("[bold]Error[/]").Centered());
+
+    foreach (var error in errors
+        .OrderBy(e => e.ResourceGroupName)
+        .ThenBy(e => e.AppName)
+        .ThenBy(e => e.SlotName)
+        .ThenBy(e => e.Message))
+    {
+        table.AddRow(
+            Markup.Escape(error.ResourceGroupName),
+            Markup.Escape(error.AppName),
+            string.IsNullOrEmpty(error.SlotName) ? "-" : Markup.Escape(error.SlotName),
+            $"[yellow]{Markup.Escape(error.Message)}[/]");
+    }
+
+    AnsiConsole.Write(table);
+    AnsiConsole.MarkupLine($"\n[bold]Total {Markup.Escape(resourceLabel)} errors:[/] [yellow]{errors.Count}[/]");
+}
+
 // ─────────────────────────────── Reporting ───────────────────────────────
 
 string BuildSearchSummary(
     string searchDisplay,
     ConcurrentBag<(string VaultName, string SecretName, string MatchedOn)> results,
     ConcurrentBag<(string VaultName, string SecretName, string Message)> errors,
+    List<AppServiceSearchResult> webAppResults,
+    List<AppServiceSearchError> webAppErrors,
+    List<AppServiceSearchResult> functionAppResults,
+    List<AppServiceSearchError> functionAppErrors,
     List<(string Project, string Repo, string FilePath, string Branch)> devOpsResults)
 {
     var sb = new StringBuilder();
@@ -701,12 +1142,17 @@ string BuildSearchSummary(
     {
         sb.AppendLine("No Key Vault secrets matched.");
     }
+
     if (!errors.IsEmpty)
     {
-        sb.AppendLine("Errors:");
+        sb.AppendLine("Key Vault Errors:");
         foreach (var e in errors.OrderBy(e => e.VaultName).ThenBy(e => e.SecretName))
             sb.AppendLine($"  Vault: {e.VaultName}, Secret: {(string.IsNullOrEmpty(e.SecretName) ? "-" : e.SecretName)}, Error: {e.Message}");
     }
+
+    AppendAppServiceSummary(sb, AppServiceResourceType.WebApp, webAppResults, webAppErrors);
+    AppendAppServiceSummary(sb, AppServiceResourceType.FunctionApp, functionAppResults, functionAppErrors);
+
     if (devOpsResults.Count > 0)
     {
         sb.AppendLine("Azure DevOps Matches:");
@@ -714,7 +1160,58 @@ string BuildSearchSummary(
             sb.AppendLine($"  Project: {r.Project}, Repo: {r.Repo}, File: {r.FilePath}, Branch: {r.Branch}");
         sb.AppendLine($"Total DevOps matches: {devOpsResults.Count}");
     }
+    else
+    {
+        sb.AppendLine("No Azure DevOps matches found.");
+    }
+
     return sb.ToString();
+}
+
+void AppendAppServiceSummary(
+    StringBuilder sb,
+    AppServiceResourceType resourceType,
+    List<AppServiceSearchResult> results,
+    List<AppServiceSearchError> errors)
+{
+    var resourceLabel = GetAppServiceResourceTypeLabel(resourceType);
+
+    if (results.Count > 0)
+    {
+        sb.AppendLine($"{resourceLabel} Matches:");
+        foreach (var result in results
+            .OrderBy(r => r.ResourceGroupName)
+            .ThenBy(r => r.AppName)
+            .ThenBy(r => r.SlotName)
+            .ThenBy(r => r.Key)
+            .ThenBy(r => r.MatchedOn))
+        {
+            sb.AppendLine(
+                $"  Resource Group: {result.ResourceGroupName}, {resourceLabel}: {result.AppName}, Slot: {(string.IsNullOrEmpty(result.SlotName) ? "-" : result.SlotName)}, Entry Type: {result.EntryType}, Key: {result.Key}, Matched On: {result.MatchedOn}");
+        }
+        sb.AppendLine($"Total {resourceLabel} matches: {results.Count}");
+    }
+    else
+    {
+        sb.AppendLine($"No {resourceLabel} matches found.");
+    }
+
+    if (errors.Count > 0)
+    {
+        sb.AppendLine($"{resourceLabel} Errors:");
+        foreach (var error in errors
+            .OrderBy(e => e.ResourceGroupName)
+            .ThenBy(e => e.AppName)
+            .ThenBy(e => e.SlotName)
+            .ThenBy(e => e.Message))
+        {
+            sb.AppendLine(
+                $"  Resource Group: {error.ResourceGroupName}, {resourceLabel}: {error.AppName}, Slot: {(string.IsNullOrEmpty(error.SlotName) ? "-" : error.SlotName)}, Error: {error.Message}");
+        }
+        sb.AppendLine($"Total {resourceLabel} errors: {errors.Count}");
+    }
+
+    sb.AppendLine();
 }
 
 async Task GenerateCopilotReportAsync(List<string> summaries, string? searchArg)
@@ -929,4 +1426,55 @@ class VaultCacheItem
 {
     public string Name { get; set; } = string.Empty;
     public string VaultUri { get; set; } = string.Empty;
+}
+
+record AppServiceApp(
+    string SubscriptionId,
+    string AppName,
+    string ResourceGroupName,
+    string Kind,
+    List<string> SlotNames);
+
+record AppServiceDiscoveryResult(
+    List<AppServiceApp> WebApps,
+    List<AppServiceApp> FunctionApps);
+
+record AppServiceConfiguration(
+    AppServiceApp App,
+    AppServiceResourceType ResourceType,
+    List<AppServiceConfigurationEntry> Entries,
+    List<string> Errors);
+
+record AppServiceSearchResult(
+    AppServiceResourceType ResourceType,
+    string ResourceGroupName,
+    string AppName,
+    string? SlotName,
+    AppServiceConfigurationEntryType EntryType,
+    string Key,
+    string MatchedOn);
+
+record AppServiceSearchError(
+    AppServiceResourceType ResourceType,
+    string ResourceGroupName,
+    string AppName,
+    string? SlotName,
+    string Message);
+
+record AppServiceConfigurationEntry(
+    string? SlotName,
+    AppServiceConfigurationEntryType EntryType,
+    string Key,
+    string? Value);
+
+enum AppServiceResourceType
+{
+    WebApp,
+    FunctionApp
+}
+
+enum AppServiceConfigurationEntryType
+{
+    AppSetting,
+    ConnectionString
 }

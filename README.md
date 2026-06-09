@@ -1,14 +1,16 @@
 # ConnectionsExplorer
 
-A .NET 10 CLI tool that scans Azure Key Vault secrets and Azure DevOps repositories to help track down incoming connections to specified services. It searches secret names, secret values, and code in DevOps repos for user-supplied terms, then optionally generates a Markdown report using GitHub Copilot.
+A .NET 10 CLI tool that scans Azure Key Vault secrets, Azure Web App settings, Azure Function App settings, and Azure DevOps repositories to help track down incoming connections to specified services. It searches secret names, secret values, App Service app setting names and values, connection string names and values, slot-specific settings, and code in DevOps repos for user-supplied terms, then optionally generates a Markdown report using GitHub Copilot.
 
 ## Features
 
 - **Subscription Discovery** — Lists all Azure subscriptions available to the logged-in user and allows selection by name or ID.
-- **Key Vault Scanning** — Discovers Key Vaults in resource groups containing "QA" or "Staging", then searches secret names and values for the given terms.
+- **Resource Group Selection** — Filters resource groups to names containing `QA` or `Staging`, alphabetizes them, and lets you choose which ones to scan with a multi-select prompt.
+- **Key Vault Scanning** — Discovers Key Vaults only in the selected resource groups, then searches secret names and values for the given terms.
+- **Web App and Function App Scanning** — Discovers Azure Web Apps and Azure Function Apps in the selected resource groups and searches root and slot-specific App Settings plus connection strings.
 - **Azure DevOps Code Search** — Searches `*.json` files across all repositories in an Azure DevOps organization for the same terms.
 - **Copilot Report Generation** — Uses the GitHub Copilot SDK to produce a well-formatted Markdown summary of all search results.
-- **Interactive Loop** — Supports repeated searches without re-fetching vault or repo metadata.
+- **Interactive Loop** — Supports repeated searches without re-fetching vault, app, or repo metadata.
 
 ## Prerequisites
 
@@ -69,6 +71,8 @@ dotnet run --project ConnectionsExplorer [subscription] [devOpsOrg] [searchTerms
 
 All three arguments are optional. When omitted, the tool will prompt interactively.
 
+When running interactively, after you choose a subscription, the tool lists only resource groups whose names contain `QA` or `Staging`. You can then select one or more resource groups with a `Spectre.Console` multi-select prompt. This selection applies to Key Vaults, Web Apps, and Function Apps. If you select no resource groups, Azure resource searches are skipped.
+
 | Position | Argument | Description |
 |----------|----------|-------------|
 | 1 | `subscription` | Subscription name (partial match) or ID. If omitted, an interactive picker is shown. |
@@ -103,10 +107,28 @@ dotnet run --project ConnectionsExplorer "My Subscription" "skip" "redis"
 
 After the first search completes, the tool enters an interactive loop where you can run additional searches or type `quit` to exit.
 
+## Azure Search Scope
+
+For selected resource groups, the tool searches:
+
+- **Key Vaults**
+  - Secret names
+  - Secret values
+- **Web Apps**
+  - Root App Settings names and values
+  - Root connection string names and values
+  - Slot App Settings names and values
+  - Slot connection string names and values
+- **Function Apps**
+  - Root App Settings names and values
+  - Root connection string names and values
+  - Slot App Settings names and values
+  - Slot connection string names and values
+
 ## Output
 
-- **Console** — Results are displayed in formatted tables (Key Vault matches, DevOps code matches, and any errors/warnings).
-- **Markdown Report** — When Copilot is available, a `.md` file is written to the current directory named `<searchTerms>-<timestamp>.md`.
+- **Console** — Results are displayed in formatted tables for Key Vaults, Web Apps, Function Apps, Azure DevOps, and any related errors/warnings.
+- **Markdown Report** — When Copilot is available, a `.md` file is written to the current directory named `<searchTerms>-<timestamp>.md` and includes Key Vault, Web App, Function App, and DevOps results.
 
 ## License
 
