@@ -13,9 +13,11 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using GitHub.Copilot.SDK;
 
-var subscriptionArg = args.Length > 0 ? args[0] : null;
-var devOpsOrgArg = args.Length > 1 ? args[1] : null;
-var searchArg = args.Length > 2 ? args[2] : null;
+var filteredArgs = args.Where(arg => !IsSaveMarkdownSwitch(arg)).ToArray();
+var saveMarkdownFromCli = args.Any(IsSaveMarkdownSwitch);
+var subscriptionArg = filteredArgs.Length > 0 ? filteredArgs[0] : null;
+var devOpsOrgArg = filteredArgs.Length > 1 ? filteredArgs[1] : null;
+var searchArg = filteredArgs.Length > 2 ? filteredArgs[2] : null;
 var searchArgFromCli = searchArg is not null;
 
 // Main menu: choose search mode
@@ -136,7 +138,7 @@ if (deniedVaultNames.Count > 0)
 }
 
 // Interactive search loop
-var allSearchSummaries = new List<string>();
+var allSearchReports = new List<SearchReport>();
 var firstRun = true;
 while (true)
 {
@@ -167,23 +169,40 @@ while (true)
         DisplayDevOpsResults(devOpsResults, searchDisplay);
     }
 
-    allSearchSummaries.Add(BuildSearchSummary(
-        searchDisplay,
-        results,
-        errors,
-        webAppResults,
-        webAppErrors,
-        functionAppResults,
-        functionAppErrors,
-        devOpsResults));
+    allSearchReports.Add(
+        CreateSearchReport(
+            searchDisplay,
+            results,
+            errors,
+            webAppResults,
+            webAppErrors,
+            functionAppResults,
+            functionAppErrors,
+            devOpsResults));
 
     if (wasCliSearch)
         break;
 }
 
-// Generate Copilot markdown report
-if (allSearchSummaries.Count > 0)
-    await GenerateCopilotReportAsync(allSearchSummaries, searchArg);
+if (allSearchReports.Count > 0)
+{
+    var combinedSearchDisplay = string.Join(
+        " | ",
+        allSearchReports
+            .Select(report => report.SearchDisplay)
+            .Distinct(StringComparer.OrdinalIgnoreCase));
+
+    var shouldSaveMarkdown = saveMarkdownFromCli;
+    if (!saveMarkdownFromCli && !searchArgFromCli)
+    {
+        shouldSaveMarkdown = AnsiConsole.Confirm(
+            "Save the full report as a Markdown file?",
+            false);
+    }
+
+    if (shouldSaveMarkdown)
+        await SaveMarkdownReportAsync(allSearchReports, combinedSearchDisplay);
+}
 
 return;
 
@@ -1118,7 +1137,7 @@ void DisplayAppServiceErrors(
 
 // ─────────────────────────────── Reporting ───────────────────────────────
 
-string BuildSearchSummary(
+SearchReport CreateSearchReport(
     string searchDisplay,
     ConcurrentBag<(string VaultName, string SecretName, string MatchedOn)> results,
     ConcurrentBag<(string VaultName, string SecretName, string Message)> errors,
@@ -1128,172 +1147,317 @@ string BuildSearchSummary(
     List<AppServiceSearchError> functionAppErrors,
     List<(string Project, string Repo, string FilePath, string Branch)> devOpsResults)
 {
+    return new SearchReport(
+        searchDisplay,
+        results
+            .OrderBy(r => r.VaultName)
+            .ThenBy(r => r.SecretName)
+            .Select(r => new KeyVaultMatch(r.VaultName, r.SecretName, r.MatchedOn))
+            .ToList(),
+        errors
+            .OrderBy(e => e.VaultName)
+            .ThenBy(e => e.SecretName)
+            .Select(e => new KeyVaultError(e.VaultName, e.SecretName, e.Message))
+            .ToList(),
+        webAppResults
+            .OrderBy(r => r.ResourceGroupName)
+            .ThenBy(r => r.AppName)
+            .ThenBy(r => r.SlotName)
+            .ThenBy(r => r.Key)
+            .ThenBy(r => r.MatchedOn)
+            .ToList(),
+        webAppErrors
+            .OrderBy(e => e.ResourceGroupName)
+            .ThenBy(e => e.AppName)
+            .ThenBy(e => e.SlotName)
+            .ThenBy(e => e.Message)
+            .ToList(),
+        functionAppResults
+            .OrderBy(r => r.ResourceGroupName)
+            .ThenBy(r => r.AppName)
+            .ThenBy(r => r.SlotName)
+            .ThenBy(r => r.Key)
+            .ThenBy(r => r.MatchedOn)
+            .ToList(),
+        functionAppErrors
+            .OrderBy(e => e.ResourceGroupName)
+            .ThenBy(e => e.AppName)
+            .ThenBy(e => e.SlotName)
+            .ThenBy(e => e.Message)
+            .ToList(),
+        devOpsResults
+            .OrderBy(r => r.Project)
+            .ThenBy(r => r.Repo)
+            .ThenBy(r => r.FilePath)
+            .Select(r => new DevOpsMatch(r.Project, r.Repo, r.FilePath, r.Branch))
+            .ToList());
+}
+
+async Task SaveMarkdownReportAsync(
+    List<SearchReport> reports,
+    string searchDisplay)
+{
+    var generatedAt = DateTimeOffset.Now;
+    var markdownContent = BuildMarkdownReport(reports, searchDisplay, generatedAt);
+    var outputPath = Path.Combine(
+        Environment.CurrentDirectory,
+        BuildMarkdownFileName(searchDisplay, generatedAt));
+
+    try
+    {
+        await File.WriteAllTextAsync(outputPath, markdownContent, Encoding.UTF8);
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"[green]Markdown report saved to:[/] {Markup.Escape(outputPath)}");
+    }
+    catch (Exception ex)
+    {
+        AnsiConsole.MarkupLine($"[yellow]Could not save Markdown report:[/] {Markup.Escape(ex.Message)}");
+    }
+}
+
+string BuildMarkdownReport(
+    List<SearchReport> reports,
+    string searchDisplay,
+    DateTimeOffset generatedAt)
+{
     var sb = new StringBuilder();
-    sb.AppendLine($"Search Terms: \"{searchDisplay}\"");
+    sb.AppendLine("# Connections Explorer Report");
     sb.AppendLine();
-    if (!results.IsEmpty)
-    {
-        sb.AppendLine("Key Vault Matches:");
-        foreach (var r in results.OrderBy(r => r.VaultName).ThenBy(r => r.SecretName))
-            sb.AppendLine($"  Vault: {r.VaultName}, Secret: {r.SecretName}, Matched On: {r.MatchedOn}");
-        sb.AppendLine($"Total Key Vault matches: {results.Count}");
-    }
-    else
-    {
-        sb.AppendLine("No Key Vault secrets matched.");
-    }
+    sb.AppendLine($"- Date: {generatedAt:yyyy-MM-dd HH:mm:ss zzz}");
+    sb.AppendLine($"- Search string: {searchDisplay}");
+    sb.AppendLine();
 
-    if (!errors.IsEmpty)
+    for (var index = 0; index < reports.Count; index++)
     {
-        sb.AppendLine("Key Vault Errors:");
-        foreach (var e in errors.OrderBy(e => e.VaultName).ThenBy(e => e.SecretName))
-            sb.AppendLine($"  Vault: {e.VaultName}, Secret: {(string.IsNullOrEmpty(e.SecretName) ? "-" : e.SecretName)}, Error: {e.Message}");
-    }
+        var report = reports[index];
+        var heading = reports.Count == 1
+            ? $"## Results for {report.SearchDisplay}"
+            : $"## Search {index + 1}: {report.SearchDisplay}";
 
-    AppendAppServiceSummary(sb, AppServiceResourceType.WebApp, webAppResults, webAppErrors);
-    AppendAppServiceSummary(sb, AppServiceResourceType.FunctionApp, functionAppResults, functionAppErrors);
-
-    if (devOpsResults.Count > 0)
-    {
-        sb.AppendLine("Azure DevOps Matches:");
-        foreach (var r in devOpsResults.OrderBy(r => r.Project).ThenBy(r => r.Repo).ThenBy(r => r.FilePath))
-            sb.AppendLine($"  Project: {r.Project}, Repo: {r.Repo}, File: {r.FilePath}, Branch: {r.Branch}");
-        sb.AppendLine($"Total DevOps matches: {devOpsResults.Count}");
-    }
-    else
-    {
-        sb.AppendLine("No Azure DevOps matches found.");
+        sb.AppendLine(heading);
+        sb.AppendLine();
+        AppendOverviewSection(sb, report);
+        AppendKeyVaultSection(sb, report);
+        AppendAppServiceSection(sb, "Web Apps", report.WebAppResults, report.WebAppErrors);
+        AppendAppServiceSection(sb, "Function Apps", report.FunctionAppResults, report.FunctionAppErrors);
+        AppendDevOpsSection(sb, report.DevOpsMatches);
+        sb.AppendLine();
     }
 
     return sb.ToString();
 }
 
-void AppendAppServiceSummary(
-    StringBuilder sb,
-    AppServiceResourceType resourceType,
-    List<AppServiceSearchResult> results,
-    List<AppServiceSearchError> errors)
+void AppendOverviewSection(StringBuilder sb, SearchReport report)
 {
-    var resourceLabel = GetAppServiceResourceTypeLabel(resourceType);
+    sb.AppendLine("### Overview");
+    sb.AppendLine();
+    AppendMarkdownTable(
+        sb,
+        ["Source", "Matches", "Errors"],
+        [
+            ["Key Vault", report.KeyVaultMatches.Count.ToString(), report.KeyVaultErrors.Count.ToString()],
+            ["Web Apps", report.WebAppResults.Count.ToString(), report.WebAppErrors.Count.ToString()],
+            ["Function Apps", report.FunctionAppResults.Count.ToString(), report.FunctionAppErrors.Count.ToString()],
+            ["Azure DevOps", report.DevOpsMatches.Count.ToString(), "-"]
+        ]);
+}
 
-    if (results.Count > 0)
+void AppendKeyVaultSection(StringBuilder sb, SearchReport report)
+{
+    sb.AppendLine("### Key Vault");
+    sb.AppendLine();
+
+    if (report.KeyVaultMatches.Count > 0)
     {
-        sb.AppendLine($"{resourceLabel} Matches:");
-        foreach (var result in results
-            .OrderBy(r => r.ResourceGroupName)
-            .ThenBy(r => r.AppName)
-            .ThenBy(r => r.SlotName)
-            .ThenBy(r => r.Key)
-            .ThenBy(r => r.MatchedOn))
-        {
-            sb.AppendLine(
-                $"  Resource Group: {result.ResourceGroupName}, {resourceLabel}: {result.AppName}, Slot: {(string.IsNullOrEmpty(result.SlotName) ? "-" : result.SlotName)}, Entry Type: {result.EntryType}, Key: {result.Key}, Matched On: {result.MatchedOn}");
-        }
-        sb.AppendLine($"Total {resourceLabel} matches: {results.Count}");
+        sb.AppendLine("#### Matches");
+        sb.AppendLine();
+        AppendMarkdownTable(
+            sb,
+            ["Vault", "Secret", "Matched On"],
+            report.KeyVaultMatches.Select(result => new[]
+            {
+                result.VaultName,
+                result.SecretName,
+                result.MatchedOn
+            }));
     }
     else
     {
-        sb.AppendLine($"No {resourceLabel} matches found.");
+        sb.AppendLine("No Key Vault secrets matched.");
+        sb.AppendLine();
+    }
+
+    if (report.KeyVaultErrors.Count > 0)
+    {
+        sb.AppendLine("#### Errors");
+        sb.AppendLine();
+        AppendMarkdownTable(
+            sb,
+            ["Vault", "Secret", "Error"],
+            report.KeyVaultErrors.Select(error => new[]
+            {
+                error.VaultName,
+                error.SecretName,
+                error.Message
+            }));
+    }
+}
+
+void AppendAppServiceSection(
+    StringBuilder sb,
+    string sectionTitle,
+    List<AppServiceSearchResult> results,
+    List<AppServiceSearchError> errors)
+{
+    sb.AppendLine($"### {sectionTitle}");
+    sb.AppendLine();
+
+    if (results.Count > 0)
+    {
+        sb.AppendLine("#### Matches");
+        sb.AppendLine();
+        AppendMarkdownTable(
+            sb,
+            ["Resource Group", "App", "Slot", "Entry Type", "Key", "Matched On"],
+            results.Select(result => new[]
+            {
+                result.ResourceGroupName,
+                result.AppName,
+                result.SlotName,
+                result.EntryType.ToString(),
+                result.Key,
+                result.MatchedOn
+            }));
+    }
+    else
+    {
+        sb.AppendLine($"No {sectionTitle.ToLowerInvariant()} matches found.");
+        sb.AppendLine();
     }
 
     if (errors.Count > 0)
     {
-        sb.AppendLine($"{resourceLabel} Errors:");
-        foreach (var error in errors
-            .OrderBy(e => e.ResourceGroupName)
-            .ThenBy(e => e.AppName)
-            .ThenBy(e => e.SlotName)
-            .ThenBy(e => e.Message))
-        {
-            sb.AppendLine(
-                $"  Resource Group: {error.ResourceGroupName}, {resourceLabel}: {error.AppName}, Slot: {(string.IsNullOrEmpty(error.SlotName) ? "-" : error.SlotName)}, Error: {error.Message}");
-        }
-        sb.AppendLine($"Total {resourceLabel} errors: {errors.Count}");
+        sb.AppendLine("#### Errors");
+        sb.AppendLine();
+        AppendMarkdownTable(
+            sb,
+            ["Resource Group", "App", "Slot", "Error"],
+            errors.Select(error => new[]
+            {
+                error.ResourceGroupName,
+                error.AppName,
+                error.SlotName,
+                error.Message
+            }));
     }
+}
+
+void AppendDevOpsSection(StringBuilder sb, List<DevOpsMatch> devOpsMatches)
+{
+    sb.AppendLine("### Azure DevOps");
+    sb.AppendLine();
+
+    if (devOpsMatches.Count > 0)
+    {
+        AppendMarkdownTable(
+            sb,
+            ["Project", "Repo", "File", "Branch"],
+            devOpsMatches.Select(match => new[]
+            {
+                match.Project,
+                match.Repo,
+                match.FilePath,
+                match.Branch
+            }));
+
+        return;
+    }
+
+    sb.AppendLine("No Azure DevOps matches found.");
+    sb.AppendLine();
+}
+
+void AppendMarkdownTable(
+    StringBuilder sb,
+    IReadOnlyList<string> headers,
+    IEnumerable<string?[]> rows)
+{
+    var materializedRows = rows.ToList();
+
+    sb.AppendLine($"| {string.Join(" | ", headers.Select(EscapeMarkdownTableCell))} |");
+    sb.AppendLine($"| {string.Join(" | ", headers.Select(_ => "---"))} |");
+
+    foreach (var row in materializedRows)
+        sb.AppendLine($"| {string.Join(" | ", row.Select(EscapeMarkdownTableCell))} |");
 
     sb.AppendLine();
 }
 
-async Task GenerateCopilotReportAsync(List<string> summaries, string? searchArg)
+string EscapeMarkdownTableCell(string? value)
 {
-    AnsiConsole.WriteLine();
-    AnsiConsole.MarkupLine("[bold blue]Generating Markdown report with Copilot...[/]");
+    if (string.IsNullOrWhiteSpace(value))
+        return "-";
 
-    try
+    return value
+        .Replace("\\", "\\\\", StringComparison.Ordinal)
+        .Replace("|", "\\|", StringComparison.Ordinal)
+        .Replace("\r\n", "<br/>", StringComparison.Ordinal)
+        .Replace("\n", "<br/>", StringComparison.Ordinal)
+        .Trim();
+}
+
+string BuildMarkdownFileName(string searchDisplay, DateTimeOffset generatedAt)
+{
+    var safeSearchDisplay = BuildSafeSearchToken(searchDisplay);
+    return $"ConnectionsExplorer-{generatedAt:yyyyMMdd-HHmmss}-{safeSearchDisplay}.md";
+}
+
+string BuildSafeSearchToken(string searchDisplay)
+{
+    var trimmedSearchDisplay = searchDisplay.Trim();
+    if (string.IsNullOrWhiteSpace(trimmedSearchDisplay))
+        return "search";
+
+    var encoded = Uri.EscapeDataString(trimmedSearchDisplay);
+    var invalidFileNameChars = Path.GetInvalidFileNameChars().ToHashSet();
+    var sb = new StringBuilder(encoded.Length);
+    var previousWasSeparator = false;
+
+    foreach (var ch in encoded)
     {
-        await using var copilotClient = new CopilotClient();
-        await copilotClient.StartAsync();
+        var normalizedChar = invalidFileNameChars.Contains(ch) || char.IsWhiteSpace(ch)
+            ? '-'
+            : ch;
 
-        await using var session = await copilotClient.CreateSessionAsync(new SessionConfig
+        if (normalizedChar == '-')
         {
-            Streaming = true,
-			Model = "claude-opus-4.6",
-			OnPermissionRequest = PermissionHandler.ApproveAll,
-            SystemMessage = new SystemMessageConfig
-            {
-                Mode = SystemMessageMode.Append,
-                Content = "You are a report generator. Given raw search results data, produce a clean, well-structured Markdown document with a title, summary, and tables. Output only the raw markdown content with no wrapping code fences."
-            }
-        });
+            if (previousWasSeparator)
+                continue;
 
-        var markdownContent = string.Empty;
-        var done = new TaskCompletionSource();
-
-        session.On(evt =>
-        {
-            switch (evt)
-            {
-                case AssistantMessageDeltaEvent delta:
-                    AnsiConsole.Write(delta.Data.DeltaContent);
-                    break;
-                case AssistantMessageEvent msg:
-                    markdownContent = msg.Data.Content;
-                    break;
-                case SessionErrorEvent error:
-                    AnsiConsole.MarkupLine($"\n[red]Copilot error: {Markup.Escape(error.Data.Message)}[/]");
-                    done.TrySetResult();
-                    break;
-                case SessionIdleEvent:
-                    done.TrySetResult();
-                    break;
-            }
-        });
-
-        var prompt = $"""
-            Attached are the search results across Azure DevOps, \
-            search the secrets of any accessible Azure KeyVault Secrets as well as any results in Azure DevOps repo code searches. \
-            This will be used to help track down any incoming connections to specified services. \
-            Create a well-formatted Markdown report for the following search results.
-            Include a title, summary section, and use tables where appropriate.
-            Output only the raw markdown content. Be sure to include all relevant information from the search results in the report. \
-            The name of the report file should be "Inbound-Direct-Connections-{searchArg}-{DateTime.Now:yyyyMMdd-HHmmss}.md". \
-
-            {string.Join("\n---\n", summaries)}
-            """;
-
-        await session.SendAsync(new MessageOptions { Prompt = prompt });
-        await done.Task;
-
-        if (!string.IsNullOrWhiteSpace(markdownContent))
-        {
-            // Delete any previous reports for these search terms
-            var prefix = $"{searchArg}-";
-            foreach (var oldFile in Directory.EnumerateFiles(Environment.CurrentDirectory, $"{prefix}*.md"))
-            {
-                try { File.Delete(oldFile); }
-                catch { /* best-effort cleanup */ }
-            }
-
-            var outputPath = Path.Combine(Environment.CurrentDirectory, $"{prefix}{DateTime.Now:yyyyMMdd-HHmmss}.md");
-            await File.WriteAllTextAsync(outputPath, markdownContent);
-            AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine($"[green]Markdown report saved to:[/] {Markup.Escape(outputPath)}");
+            previousWasSeparator = true;
+            sb.Append(normalizedChar);
+            continue;
         }
+
+        previousWasSeparator = false;
+        sb.Append(normalizedChar);
     }
-    catch (Exception ex)
-    {
-        AnsiConsole.MarkupLine($"[yellow]Could not generate Copilot report:[/] {Markup.Escape(ex.Message)}");
-    }
+
+    var safeToken = sb.ToString().Trim(' ', '.', '-');
+    if (string.IsNullOrWhiteSpace(safeToken))
+        return "search";
+
+    const int maxTokenLength = 80;
+    return safeToken.Length <= maxTokenLength
+        ? safeToken
+        : safeToken[..maxTokenLength].Trim(' ', '.', '-');
+}
+
+bool IsSaveMarkdownSwitch(string arg)
+{
+    return arg.Equals("--save-markdown", StringComparison.OrdinalIgnoreCase)
+        || arg.Equals("--markdown", StringComparison.OrdinalIgnoreCase)
+        || arg.Equals("-m", StringComparison.OrdinalIgnoreCase);
 }
 
 // ─────────────────────────────── API Endpoint Search ───────────────────────────────
@@ -1460,6 +1624,32 @@ record AppServiceSearchError(
     string AppName,
     string? SlotName,
     string Message);
+
+record KeyVaultMatch(
+    string VaultName,
+    string SecretName,
+    string MatchedOn);
+
+record KeyVaultError(
+    string VaultName,
+    string SecretName,
+    string Message);
+
+record DevOpsMatch(
+    string Project,
+    string Repo,
+    string FilePath,
+    string Branch);
+
+record SearchReport(
+    string SearchDisplay,
+    List<KeyVaultMatch> KeyVaultMatches,
+    List<KeyVaultError> KeyVaultErrors,
+    List<AppServiceSearchResult> WebAppResults,
+    List<AppServiceSearchError> WebAppErrors,
+    List<AppServiceSearchResult> FunctionAppResults,
+    List<AppServiceSearchError> FunctionAppErrors,
+    List<DevOpsMatch> DevOpsMatches);
 
 record AppServiceConfigurationEntry(
     string? SlotName,
