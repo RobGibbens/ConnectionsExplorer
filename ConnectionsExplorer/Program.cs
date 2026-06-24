@@ -78,6 +78,17 @@ else
     AnsiConsole.MarkupLine($"Selected [green]{selectedResourceGroups.Count}[/] resource group(s) for Azure resource searches.");
 }
 
+// Set up Azure DevOps
+AnsiConsole.WriteLine();
+var (devOpsOrg, searchDevOps) = ResolveDevOpsOrganization(devOpsOrgArg);
+var devOpsRepos = new List<(string Project, string Repo, string DefaultBranch)>();
+if (searchDevOps)
+{
+    (devOpsRepos, searchDevOps) = await DiscoverDevOpsReposAsync(devOpsOrg);
+    if (searchDevOps)
+        AnsiConsole.MarkupLine($"Found [green]{devOpsRepos.Count}[/] Azure DevOps repo(s) in organization [blue]{Markup.Escape(devOpsOrg)}[/].");
+}
+
 // Discover Key Vaults in the selected subscription (with local cache)
 List<(string Name, Uri VaultUri)> vaults;
 if (selectedResourceGroupSet.Count == 0)
@@ -99,17 +110,6 @@ var webAppConfigurations = await LoadAppServiceConfigurationsAsync(appDiscovery.
 var functionAppConfigurations = await LoadAppServiceConfigurationsAsync(appDiscovery.FunctionApps, AppServiceResourceType.FunctionApp);
 
 AnsiConsole.MarkupLine($"Found [green]{appDiscovery.WebApps.Count}[/] Web App(s) and [green]{appDiscovery.FunctionApps.Count}[/] Function App(s).");
-
-// Set up Azure DevOps
-AnsiConsole.WriteLine();
-var (devOpsOrg, searchDevOps) = ResolveDevOpsOrganization(devOpsOrgArg);
-var devOpsRepos = new List<(string Project, string Repo, string DefaultBranch)>();
-if (searchDevOps)
-{
-    (devOpsRepos, searchDevOps) = await DiscoverDevOpsReposAsync(devOpsOrg);
-    if (searchDevOps)
-        AnsiConsole.MarkupLine($"Found [green]{devOpsRepos.Count}[/] Azure DevOps repo(s) in organization [blue]{Markup.Escape(devOpsOrg)}[/].");
-}
 
 if (vaults.Count == 0
     && webAppConfigurations.Count == 0
@@ -140,6 +140,7 @@ if (deniedVaultNames.Count > 0)
 // Interactive search loop
 var allSearchReports = new List<SearchReport>();
 var firstRun = true;
+var markdownSavedDuringLoop = false;
 while (true)
 {
     AnsiConsole.WriteLine();
@@ -169,16 +170,28 @@ while (true)
         DisplayDevOpsResults(devOpsResults, searchDisplay);
     }
 
-    allSearchReports.Add(
-        CreateSearchReport(
-            searchDisplay,
-            results,
-            errors,
-            webAppResults,
-            webAppErrors,
-            functionAppResults,
-            functionAppErrors,
-            devOpsResults));
+    var searchReport = CreateSearchReport(
+        searchDisplay,
+        results,
+        errors,
+        webAppResults,
+        webAppErrors,
+        functionAppResults,
+        functionAppErrors,
+        devOpsResults);
+    allSearchReports.Add(searchReport);
+
+    if (!wasCliSearch && AnsiConsole.Confirm("Save the full report as a Markdown file?", false))
+    {
+        var combinedSearchDisplay = string.Join(
+            " | ",
+            allSearchReports
+                .Select(report => report.SearchDisplay)
+                .Distinct(StringComparer.OrdinalIgnoreCase));
+
+        await SaveMarkdownReportAsync(allSearchReports, combinedSearchDisplay);
+        markdownSavedDuringLoop = true;
+    }
 
     if (wasCliSearch)
         break;
@@ -193,7 +206,7 @@ if (allSearchReports.Count > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase));
 
     var shouldSaveMarkdown = saveMarkdownFromCli;
-    if (!saveMarkdownFromCli && !searchArgFromCli)
+    if (!saveMarkdownFromCli && !searchArgFromCli && !markdownSavedDuringLoop)
     {
         shouldSaveMarkdown = AnsiConsole.Confirm(
             "Save the full report as a Markdown file?",
@@ -1202,16 +1215,25 @@ async Task SaveMarkdownReportAsync(
     var outputPath = Path.Combine(
         Environment.CurrentDirectory,
         BuildMarkdownFileName(searchDisplay, generatedAt));
+    var markdownWarnings = ValidateMarkdownReport(markdownContent);
 
     try
     {
         await File.WriteAllTextAsync(outputPath, markdownContent, Encoding.UTF8);
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine($"[green]Markdown report saved to:[/] {Markup.Escape(outputPath)}");
     }
     catch (Exception ex)
     {
         AnsiConsole.MarkupLine($"[yellow]Could not save Markdown report:[/] {Markup.Escape(ex.Message)}");
+        return;
+    }
+
+    AnsiConsole.WriteLine();
+    AnsiConsole.MarkupLine($"[green]Markdown report saved to:[/] [link={Markup.Escape(outputPath)}]{Markup.Escape(outputPath)}[/]");
+
+    if (markdownWarnings.Count > 0)
+    {
+        foreach (var warning in markdownWarnings)
+            AnsiConsole.MarkupLine($"[yellow]Markdown warning:[/] {Markup.Escape(warning)}");
     }
 }
 
@@ -1221,18 +1243,21 @@ string BuildMarkdownReport(
     DateTimeOffset generatedAt)
 {
     var sb = new StringBuilder();
+    var normalizedSearchDisplay = NormalizeMarkdownInlineText(searchDisplay);
+
     sb.AppendLine("# Connections Explorer Report");
     sb.AppendLine();
     sb.AppendLine($"- Date: {generatedAt:yyyy-MM-dd HH:mm:ss zzz}");
-    sb.AppendLine($"- Search string: {searchDisplay}");
+    sb.AppendLine($"- Search string: {normalizedSearchDisplay}");
     sb.AppendLine();
 
     for (var index = 0; index < reports.Count; index++)
     {
         var report = reports[index];
+        var normalizedReportSearchDisplay = NormalizeMarkdownInlineText(report.SearchDisplay);
         var heading = reports.Count == 1
-            ? $"## Results for {report.SearchDisplay}"
-            : $"## Search {index + 1}: {report.SearchDisplay}";
+            ? $"## Results for {normalizedReportSearchDisplay}"
+            : $"## Search {index + 1}: {normalizedReportSearchDisplay}";
 
         sb.AppendLine(heading);
         sb.AppendLine();
@@ -1404,6 +1429,36 @@ string EscapeMarkdownTableCell(string? value)
         .Replace("\r\n", "<br/>", StringComparison.Ordinal)
         .Replace("\n", "<br/>", StringComparison.Ordinal)
         .Trim();
+}
+
+string NormalizeMarkdownInlineText(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return "-";
+
+    return value
+        .Replace("\\", "\\\\", StringComparison.Ordinal)
+        .Replace("`", "\\`", StringComparison.Ordinal)
+        .Replace("[", "\\[", StringComparison.Ordinal)
+        .Replace("]", "\\]", StringComparison.Ordinal)
+        .Replace("*", "\\*", StringComparison.Ordinal)
+        .Replace("_", "\\_", StringComparison.Ordinal)
+        .Replace("\r\n", " ", StringComparison.Ordinal)
+        .Replace("\n", " ", StringComparison.Ordinal)
+        .Trim();
+}
+
+List<string> ValidateMarkdownReport(string markdownContent)
+{
+    var warnings = new List<string>();
+    var fencedCodeBlockDelimiterCount = markdownContent
+        .Split('\n')
+        .Count(line => line.TrimStart().StartsWith("```", StringComparison.Ordinal));
+
+    if (fencedCodeBlockDelimiterCount % 2 != 0)
+        warnings.Add("The report contains an unmatched fenced code block delimiter.");
+
+    return warnings;
 }
 
 string BuildMarkdownFileName(string searchDisplay, DateTimeOffset generatedAt)
